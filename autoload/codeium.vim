@@ -499,24 +499,10 @@ function! codeium#AddTrackedWorkspace() abort
 endfunction
 
 function! codeium#Chat() abort
-  if (!codeium#Enabled())
-    return
-  endif
-  try
-    call codeium#RefreshContext()
-    call codeium#server#Request('GetProcesses', codeium#server#RequestMetadata(), function('s:LaunchChat', []))
-    call codeium#AddTrackedWorkspace()
-    " If user has chat_ports set, they are probably using vim remotely and trying to use chat via port forwarding.
-    " In that case display the url here so that it is easier to copy, as the browser will fail to open automatically. 
-    let chat_ports = get(g:, 'codeium_port_config', {})
-    if has_key(chat_ports, 'chat_client') && !empty(chat_ports.chat_client) && has_key(chat_ports, 'web_server') && !empty(chat_ports.web_server)
-      let l:metadata = codeium#server#RequestMetadata()
-      let l:url = BuildChatUrl(l:metadata, chat_ports.chat_client, chat_ports.web_server)
-      echomsg l:url
-    endif
-  catch
-    call codeium#log#Exception()
-  endtry
+  echohl ErrorMsg
+  echomsg "Codeium: Chat functionality is disabled when using the Ollama backend."
+  echohl None
+  call codeium#log#Error('Chat functionality is not available with Ollama backend.')
 endfunction
 
 function! codeium#GetStatusString(...) abort

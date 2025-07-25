@@ -1,376 +1,179 @@
-let s:language_server_version = '1.20.8'
-let s:language_server_sha = '37f12b83df389802b7d4e293b3e1a986aca289c0'
-let s:root = expand('<sfile>:h:h:h')
-let s:bin = v:null
-
-if has('nvim')
-  let s:ide = 'neovim'
-else
-  let s:ide = 'vim'
-endif
-
-if !exists('s:editor_version')
-  if has('nvim')
-    let s:ide_version = matchstr(execute('version'), 'NVIM v\zs[^[:space:]]\+')
-  else
-    let major = v:version / 100
-    let minor = v:version % 100
-    if exists('v:versionlong')
-      let patch = printf('%04d', v:versionlong % 1000)
-      let s:ide_version =  major . '.' . minor . '.' . patch
-    else
-      let s:ide_version =  major . '.' . minor
-    endif
-  endif
-endif
-
-let s:server_port = v:null
-if codeium#util#IsUsingRemoteChat()
-  let s:server_port = 42100
-endif
-
-let g:codeium_server_job = v:null
-
-function! s:OnExit(result, status, on_complete_cb) abort
-  let did_close = has_key(a:result, 'closed')
-  if did_close
-    call remove(a:result, 'closed')
-    call a:on_complete_cb(a:result.out, a:result.err, a:status)
-  else
-    " Wait until we receive OnClose, and call on_complete_cb then.
-    let a:result.exit_status = a:status
-  endif
-endfunction
-
-function! s:OnClose(result, on_complete_cb) abort
-  let did_exit = has_key(a:result, 'exit_status')
-  if did_exit
-    call a:on_complete_cb(a:result.out, a:result.err, a:result.exit_status)
-  else
-    " Wait until we receive OnExit, and call on_complete_cb then.
-    let a:result.closed = v:true
-  endif
-endfunction
+" This file is heavily modified to use Ollama instead of the Codeium service.
+ " All server management, download, and heartbeat logic has been removed.
 
 function! s:NoopCallback(...) abort
 endfunction
 
-function! codeium#server#RequestMetadata() abort
-  return {
-        \ 'api_key': codeium#command#ApiKey(),
-        \ 'ide_name':  s:ide,
-        \ 'ide_version':  s:ide_version,
-        \ 'extension_name': 'vim',
-        \ 'extension_version':  s:language_server_version,
-        \ }
-endfunction
-
+" This is the core function that sends a request to the Ollama API.
+" It's a simplified version of the original `codeium#server#Request`.
 function! codeium#server#Request(type, data, ...) abort
-  if s:server_port is# v:null
-    throw 'Server port has not been properly initialized.'
+  " We only care about 'GetCompletions' requests. Ignore everything else.
+  if a:type !=# 'GetCompletions'
+    call codeium#log#Info('Ignoring request type: ' . a:type)
+    return
   endif
-  let uri = 'http://127.0.0.1:' . s:server_port .
-      \ '/exa.language_server_pb.LanguageServerService/' . a:type
-  let data = json_encode(a:data)
+
+  let ollama_api_url = get(g:, 'codeium_ollama_api_url', 'http://127.0.0.1:11434/api/generate')
+  " let ollama_model = get(g:, 'codeium_ollama_model', 'codellama:7b')
+  let ollama_model = get(g:, 'codeium_ollama_model', 'qwen2.5-coder:3b')
+  let ollama_timeout = get(g:, 'codeium_ollama_timeout', 30) " Timeout in seconds, increased to 30s
+
+  " --- Prompt Engineering ---
+  " This part is crucial for getting good results from Ollama.
+  " We'll use the Fill-in-the-Middle (FIM) format that Code Llama is trained on.
+  " https://huggingface.co/blog/codellama#fill-in-the-middle
+  " Format: <PRE>prefix<SUF>suffix<MID>
+  let doc = get(a:data, 'document', {})
+  let source = get(doc, 'text', '')
+  let cursor_offset = get(doc, 'cursorOffset', 0)
+
+  let prefix = strpart(source, 0, cursor_offset)
+  let suffix = strpart(source, cursor_offset)
+
+  " Allow disabling FIM for models that don't support it.
+  let use_fim = get(g:, 'codeium_ollama_use_fim', v:true)
+  if use_fim
+    let prompt = '<PRE>' . prefix . '<SUF>' . suffix . '<MID>'
+  else
+    let prompt = prefix
+  endif
+
+  let request_body = {
+        \ 'model': ollama_model,
+        \ 'prompt': prompt,
+        \ 'stream': v:false,
+        \ }
+
+  let data_json = json_encode(request_body)
+
+  " Read data from stdin using '-d @-' to avoid command length limits on Windows.
   let args = [
-              \ 'curl', '-L', uri,
-              \ '--max-time', '3',
-              \ '--header', 'Content-Type: application/json',
-              \ '-d@-'
-              \ ]
+            \ 'curl', '-s',
+            \ '--max-time', ollama_timeout,
+            \ ollama_api_url,
+            \ '--header', 'Content-Type: application/json',
+            \ '-d', '@-'
+            \ ]
+
+  call codeium#log#Info('--- Sending Ollama Request ---')
+  call codeium#log#Info('Timeout set to: ' . ollama_timeout . 's')
+  call codeium#log#Info('Args: ' . string(args))
+  call codeium#log#Info('Data: ' . data_json)
+
   let result = {'out': [], 'err': []}
   let ExitCallback = a:0 && !empty(a:1) ? a:1 : function('s:NoopCallback')
+
   if has('nvim')
     let jobid = jobstart(args, {
-                \ 'on_stdout': { channel, data, t -> add(result.out, join(data, "\n")) },
-                \ 'on_stderr': { channel, data, t -> add(result.err, join(data, "\n")) },
-                \ 'on_exit': { job, status, t -> ExitCallback(result.out, result.err, status) },
+                \ 'on_stdout': { _, data, __ -> extend(result.out, data) },
+                \ 'on_stderr': { _, data, __ -> extend(result.err, data) },
+                \ 'on_exit': { _, status, ___ -> s:OnOllamaExit(result, status, ExitCallback, a:data) },
                 \ })
-    call chansend(jobid, data)
+    call chansend(jobid, data_json)
     call chanclose(jobid, 'stdin')
     return jobid
   else
     let job = job_start(args, {
                 \ 'in_mode': 'raw',
-                \ 'out_mode': 'raw',
-                \ 'out_cb': { channel, data -> add(result.out, data) },
-                \ 'err_cb': { channel, data -> add(result.err, data) },
-                \ 'exit_cb': { job, status -> s:OnExit(result, status, ExitCallback) },
-                \ 'close_cb': { channel -> s:OnClose(result, ExitCallback) }
+                \ 'out_cb': { _, data -> add(result.out, data) },
+                \ 'err_cb': { _, data -> add(result.err, data) },
+                \ 'exit_cb': { _, status -> s:OnOllamaExit(result, status, ExitCallback, a:data) },
                 \ })
     let channel = job_getchannel(job)
-    call ch_sendraw(channel, data)
+    call ch_sendraw(channel, data_json)
     call ch_close_in(channel)
     return job
   endif
 endfunction
 
-function! s:FindPort(dir, timer) abort
-  let time = localtime()
-  for name in readdir(a:dir)
-    let path = a:dir . '/' . name
-    if time - getftime(path) <= 5 && getftype(path) ==# 'file'
-      call codeium#log#Info('Found port: ' . name)
-      let s:server_port = name
-      call s:RequestServerStatus()
-      call timer_stop(a:timer)
-      break
-    endif
-  endfor
-endfunction
-
-function! s:RequestServerStatus() abort
-  call codeium#server#Request('GetStatus', {'metadata': codeium#server#RequestMetadata()}, function('s:HandleGetStatusResponse'))
-endfunction
-
-function! s:HandleGetStatusResponse(out, err, status) abort
-  " Check if the request was successful
-  if a:status == 0
-    " Parse the JSON response
-    let response = json_decode(join(a:out, "\n"))
-    let status = get(response, 'status', {})
-    " Check if there is a message in the response and echo it
-    if has_key(status, 'message') && !empty(status.message)
-      echom status.message
-    endif
-  else
-    " Handle error if the status is not 0 or if there is stderr output
-    call codeium#log#Error(join(a:err, "\n"))
+" This function is called when the curl command to Ollama finishes.
+" It transforms the Ollama response into the format the plugin expects.
+function! s:OnOllamaExit(result, status, on_complete_cb, original_request_data) abort
+  call codeium#log#Info('--- Received Ollama Response ---')
+  call codeium#log#Info('Status: ' . a:status)
+  if !empty(a:result.err)
+    call codeium#log#Error('Stderr: ' . join(a:result.err, "\n"))
   endif
-endfunction
 
-function! s:SendHeartbeat(timer) abort
+  if a:status != 0
+    call codeium#log#Error('Ollama request failed. See stderr above.')
+    return
+  endif
+
+  let response_text = join(a:result.out, "")
+  call codeium#log#Info('Raw Response: ' . response_text)
+  if empty(response_text)
+    call codeium#log#Error('Ollama returned an empty response.')
+    return
+  endif
+
   try
-    call codeium#server#Request('Heartbeat', {'metadata': codeium#server#RequestMetadata()})
+    let ollama_response = json_decode(response_text)
+
+    if get(ollama_response, 'done', v:false) == v:false
+      call codeium#log#Error('Ollama response indicates an error or streaming is not complete.')
+      call codeium#log#Error('Response: ' . response_text)
+      return
+    endif
+
+    let completion_text = get(ollama_response, 'response', '')
+    if empty(completion_text)
+      call codeium#log#Info('Ollama returned a response with no completion text.')
+      return
+    endif
+
+    " Now, we build the response structure that s:HandleCompletionsResult expects.
+    " We need to provide precise context for the rendering function.
+    let doc = get(a:original_request_data, 'document', {})
+    let cursor_line_num = get(doc, 'line', 1) " 1-based line number
+    let cursor_char_num = get(doc, 'character', 1) " 1-based character number
+    let lines = split(get(doc, 'text', ''), "\n")
+    let line_text = get(lines, cursor_line_num - 1, '')
+    let line_prefix = strpart(line_text, 0, cursor_char_num - 1)
+
+    let completion_id = 'ollama-' . localtime()
+    let completion_item = {
+          \ 'completion': {
+          \   'text': completion_text,
+          \   'completionId': completion_id
+          \ },
+          \ 'range': {
+          \   'startOffset': get(doc, 'cursorOffset', 0),
+          \   'endOffset': get(doc, 'cursorOffset', 0)
+          \ },
+          \ 'completionParts': [{
+          \   'type': 'COMPLETION_PART_TYPE_INLINE',
+          \   'text': completion_text,
+          \   'line': cursor_line_num - 1, " Rendering function expects 0-based line
+          \   'prefix': line_prefix
+          \ }]
+          \ }
+
+    let plugin_response = {
+          \ 'completionItems': [completion_item]
+          \ }
+
+    let response_for_plugin = [json_encode(plugin_response)]
+    call codeium#log#Info('Transformed Response for Plugin: ' . string(response_for_plugin))
+
+    " Call the original callback with the transformed data.
+    call a:on_complete_cb(response_for_plugin, a:result.err, a:status)
+
   catch
+    call codeium#log#Error('Failed to decode Ollama JSON response.')
+    call codeium#log#Error('Response text: ' . response_text)
     call codeium#log#Exception()
   endtry
 endfunction
 
+" --- Empty functions to prevent errors from the rest of the plugin ---
+
 function! codeium#server#Start(...) abort
-  let user_defined_codeium_bin = get(g:, 'codeium_bin', '')
-
-  if user_defined_codeium_bin != '' && filereadable(user_defined_codeium_bin)
-    let s:bin = user_defined_codeium_bin
-    call s:ActuallyStart()
-    return
-  endif
-  let user_defined_os = get(g:, 'codeium_os', '')
-  let user_defined_arch = get(g:, 'codeium_arch', '')
-
-  let os = ''
-  if !empty(user_defined_os)
-    let os = user_defined_os
-  elseif has('linux')
-    let os = 'Linux'
-  elseif has('mac')
-    let os = 'Darwin'
-  elseif has('win32')
-    let os = 'Windows'
-  else
-    silent let os = substitute(system('uname'), '\n', '', '')
-  endif
-
-  let arch = ''
-  if !empty(user_defined_arch)
-    let arch = user_defined_arch
-  elseif has('nvim') && exists('*vim.loop.os_uname')
-    let arch = get(vim.loop.os_uname(), 'machine', '')
-  elseif has('win32')
-    " Assume x64 for windows, as there is no arm build for it.
-    let arch = 'x86_64'
-  else
-    silent let arch = substitute(system('uname -m'), '\n', '', '')
-  endif
-
-  let is_arm = stridx(arch, 'arm') == 0 || stridx(arch, 'aarch64') == 0
-
-  let bin_suffix = ''
-  if os ==# 'Linux' && is_arm
-    let bin_suffix = 'linux_arm'
-  elseif os ==# 'Linux'
-    let bin_suffix = 'linux_x64'
-  elseif os ==# 'Darwin' && is_arm
-    let bin_suffix = 'macos_arm'
-  elseif os ==# 'Darwin'
-    let bin_suffix = 'macos_x64'
-  elseif os ==# 'Windows'
-    let bin_suffix = 'windows_x64.exe'
-  else
-    call codeium#log#Error('Unsupported OS: ' . os)
-    return
-  endif
-
-  let config = get(g:, 'codeium_server_config', {})
-  if has_key(config, 'portal_url') && !empty(config.portal_url)
-    let response = system('curl -sL ' . config.portal_url . '/api/version')
-    if v:shell_error == '0'
-      let s:language_server_version = response
-      let s:language_server_sha = 'enterprise-' . s:language_server_version
-    else
-      call codeium#log#Error('Failed to fetch version from ' . config.portal_url)
-      call codeium#log#Error(v:shell_error)
-    endif
-  endif
-
-  let sha = get(codeium#command#LoadConfig(codeium#command#XdgConfigDir()), 'sha', s:language_server_sha)
-  let bin_dir = codeium#command#HomeDir() . '/bin/' . sha
-  let s:bin = bin_dir . '/language_server_' . bin_suffix
-  call mkdir(bin_dir, 'p')
-
-  if !filereadable(s:bin)
-    call delete(s:bin)
-    if sha ==# s:language_server_sha
-      let config = get(g:, 'codeium_server_config', {})
-      if has_key(config, 'portal_url') && !empty(config.portal_url)
-        let base_url = config.portal_url
-      else
-        let base_url = 'https://github.com/Exafunction/codeium/releases/download'
-      endif
-      let base_url = substitute(base_url, '/\+
-
-function! s:ActuallyStart() abort
-  let config = get(g:, 'codeium_server_config', {})
-  let chat_ports = get(g:, 'codeium_port_config', {})
-  let manager_dir = tempname() . '/codeium/manager'
-  call mkdir(manager_dir, 'p')
-  let args = [
-        \ s:bin,
-        \ '--api_server_url', get(config, 'api_url', 'https://server.codeium.com'),
-        \ '--enable_local_search', '--enable_index_service', '--search_max_workspace_file_count', '5000',
-        \ '--enable_chat_web_server', '--enable_chat_client'
-        \ ]
-  if has_key(config, 'api_url') && !empty(config.api_url)
-    let args += ['--enterprise_mode']
-    let args += ['--portal_url', get(config, 'portal_url', 'https://codeium.example.com')]
-  endif
-  if !codeium#util#IsUsingRemoteChat()
-    let args += ['--manager_dir', manager_dir]
-  endif
-  " If either of these is set, only one vim window (with any number of buffers) will work with Codeium.
-  " Opening other vim windows won't be able to use Codeium features.
-  if has_key(chat_ports, 'web_server') && !empty(chat_ports.web_server)
-    let args += ['--chat_web_server_port', chat_ports.web_server]
-  endif
-  if has_key(chat_ports, 'chat_client') && !empty(chat_ports.chat_client)
-    let args += ['--chat_client_port', chat_ports.chat_client]
-  endif
-
-  call codeium#log#Info('Launching server with manager_dir ' . manager_dir)
-  if has('nvim')
-    let g:codeium_server_job = jobstart(args, {
-                \ 'on_stderr': { channel, data, t -> codeium#log#Info('[SERVER] ' . join(data, "\n")) },
-                \ })
-  else
-    let g:codeium_server_job = job_start(args, {
-                \ 'out_mode': 'raw',
-                \ 'err_cb': { channel, data -> codeium#log#Info('[SERVER] ' . data) },
-                \ })
-  endif
-  if !codeium#util#IsUsingRemoteChat()
-    call timer_start(500, function('s:FindPort', [manager_dir]), {'repeat': -1})
-  endif
-
-  call timer_start(5000, function('s:SendHeartbeat', []), {'repeat': -1})
-endfunction
-, '', '')
-      let url = base_url . '/language-server-v' . s:language_server_version . '/language_server_' . bin_suffix . '.gz'
-    else
-      let url = 'https://storage.googleapis.com/exafunction-dist/codeium/' . sha . '/language_server_' . bin_suffix . '.gz'
-    endif
-    let args = ['curl', '-Lo', s:bin . '.gz', url]
-    if has('nvim')
-      let s:download_job = jobstart(args, {'on_exit': { job, status, t -> s:UnzipAndStart(status) }})
-    else
-      let s:download_job = job_start(args, {'exit_cb': { job, status -> s:UnzipAndStart(status) }})
-    endif
-  else
-    call s:ActuallyStart()
-  endif
+  " No server to start. Do nothing.
+  call codeium#log#Info('Using Ollama backend. No server to start.')
 endfunction
 
-function! s:UnzipAndStart(status) abort
-  if has('win32')
-    let old_shell_settings = {
-          \ 'shell': &shell,
-          \ 'shellquote': &shellquote,
-          \ 'shellpipe': &shellpipe,
-          \ 'shellxquote': &shellxquote,
-          \ 'shellcmdflag': &shellcmdflag,
-          \ 'shellredir': &shellredir,
-          \ }
-    try
-      let &shell = 'powershell'
-      set shellquote=\"
-      set shellpipe=\|
-      set shellcmdflag=-NoLogo\ -NoProfile\ -ExecutionPolicy\ RemoteSigned\ -Command
-      set shellredir=\|\[Out-File\]\ -Encoding\ UTF8
-      call system('& { . ' . shellescape(s:root . '/powershell/gzip.ps1') . '; Expand-File ' . shellescape(s:bin . '.gz') . ' }')
-    finally
-      let &shell = old_shell_settings.shell
-      let &shellquote = old_shell_settings.shellquote
-      let &shellpipe = old_shell_settings.shellpipe
-      let &shellxquote = old_shell_settings.shellxquote
-      let &shellcmdflag = old_shell_settings.shellcmdflag
-      let &shellredir = old_shell_settings.shellredir
-    endtry
-  else
-    if !executable('gzip')
-      call codeium#log#Error('Failed to extract language server binary: missing `gzip`.')
-      return ''
-    endif
-    call system('gzip -d ' . s:bin . '.gz')
-    call system('chmod +x ' . s:bin)
-  endif
-  if !filereadable(s:bin)
-    call codeium#log#Error('Failed to download language server binary.')
-    return ''
-  endif
-  call s:ActuallyStart()
-endfunction
-
-
-function! s:ActuallyStart() abort
-  let config = get(g:, 'codeium_server_config', {})
-  let chat_ports = get(g:, 'codeium_port_config', {})
-  let manager_dir = tempname() . '/codeium/manager'
-  call mkdir(manager_dir, 'p')
-  let args = [
-        \ s:bin,
-        \ '--api_server_url', get(config, 'api_url', 'https://server.codeium.com'),
-        \ '--enable_local_search', '--enable_index_service', '--search_max_workspace_file_count', '5000',
-        \ '--enable_chat_web_server', '--enable_chat_client'
-        \ ]
-  if has_key(config, 'api_url') && !empty(config.api_url)
-    let args += ['--enterprise_mode']
-    let args += ['--portal_url', get(config, 'portal_url', 'https://codeium.example.com')]
-  endif
-  if !codeium#util#IsUsingRemoteChat()
-    let args += ['--manager_dir', manager_dir]
-  endif
-  " If either of these is set, only one vim window (with any number of buffers) will work with Codeium.
-  " Opening other vim windows won't be able to use Codeium features.
-  if has_key(chat_ports, 'web_server') && !empty(chat_ports.web_server)
-    let args += ['--chat_web_server_port', chat_ports.web_server]
-  endif
-  if has_key(chat_ports, 'chat_client') && !empty(chat_ports.chat_client)
-    let args += ['--chat_client_port', chat_ports.chat_client]
-  endif
-
-  call codeium#log#Info('Launching server with manager_dir ' . manager_dir)
-  if has('nvim')
-    let g:codeium_server_job = jobstart(args, {
-                \ 'on_stderr': { channel, data, t -> codeium#log#Info('[SERVER] ' . join(data, "\n")) },
-                \ })
-  else
-    let g:codeium_server_job = job_start(args, {
-                \ 'out_mode': 'raw',
-                \ 'err_cb': { channel, data -> codeium#log#Info('[SERVER] ' . data) },
-                \ })
-  endif
-  if !codeium#util#IsUsingRemoteChat()
-    call timer_start(500, function('s:FindPort', [manager_dir]), {'repeat': -1})
-  endif
-
-  call timer_start(5000, function('s:SendHeartbeat', []), {'repeat': -1})
+function! codeium#server#RequestMetadata() abort
+  " This data is not needed for Ollama, but other parts of the plugin might call it.
+  return {}
 endfunction
