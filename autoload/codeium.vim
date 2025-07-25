@@ -360,20 +360,10 @@ function! codeium#Complete(...) abort
     return
   endif
 
-  let other_documents = []
-  let current_bufnr = bufnr('%')
-  let loaded_buffers = getbufinfo({'bufloaded':1})
-  for buf in loaded_buffers
-    if buf.bufnr != current_bufnr && getbufvar(buf.bufnr, '&filetype') !=# ''
-      call add(other_documents, codeium#doc#GetDocument(buf.bufnr, 1, 1))
-    endif
-  endfor
-
   let data = {
         \ 'metadata': codeium#server#RequestMetadata(),
-        \ 'document': codeium#doc#GetDocument(bufnr(), line('.'), col('.')),
+        \ 'document': codeium#doc#GetDocument(bufnr(), line('.'), col('.')), 
         \ 'editor_options': codeium#doc#GetEditorOptions(),
-        \ 'other_documents': other_documents
         \ }
 
   if exists('b:_codeium_completions.request_data') && b:_codeium_completions.request_data ==# data
@@ -443,15 +433,18 @@ function! s:LaunchChat(out, err, status) abort
   if !empty(browser)
     echomsg 'Navigating to ' . l:url
     try
-      call system(l:browser . ' ' . '"' . l:url . '"')
-      if v:shell_error is# 0
-        let l:opened_browser = v:true
+      if has('nvim')
+        call jobstart([l:browser, l:url], {'detach': v:true})
+      else
+        call job_start([l:browser, l:url])
       endif
+      let l:opened_browser = v:true
     catch
+      let l:opened_browser = v:false
     endtry
 
     if !l:opened_browser
-      echomsg 'Failed to open browser. Please go to the link above.'
+      echomsg 'Failed to open browser automatically. Please go to the link above.'
     endif
   else
     echomsg 'No available browser found. Please go to ' . l:url
