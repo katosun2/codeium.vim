@@ -158,34 +158,24 @@ function! codeium#server#Start(...) abort
   let user_defined_os = get(g:, 'codeium_os', '')
   let user_defined_arch = get(g:, 'codeium_arch', '')
 
-  let os = ''
-  if !empty(user_defined_os)
+  if user_defined_os != '' && user_defined_arch != ''
     let os = user_defined_os
-  elseif has('linux')
-    let os = 'Linux'
-  elseif has('mac')
-    let os = 'Darwin'
-  elseif has('win32')
-    let os = 'Windows'
+    let arch = user_defined_arch
   else
     silent let os = substitute(system('uname'), '\n', '', '')
-  endif
 
-  let arch = ''
-  if !empty(user_defined_arch)
-    let arch = user_defined_arch
-  elseif has('nvim') && exists('*vim.loop.os_uname')
-    let arch = get(vim.loop.os_uname(), 'machine', '')
-  elseif has('win32')
-    " Assume x64 for windows, as there is no arm build for it.
-    let arch = 'x86_64'
-  else
     silent let arch = substitute(system('uname -m'), '\n', '', '')
   endif
 
   let is_arm = stridx(arch, 'arm') == 0 || stridx(arch, 'aarch64') == 0
 
-  let bin_suffix = ''
+  if empty(os)
+    if has("linux")
+      let os = "Linux"
+    elseif has("mac")
+      let os = "Darwin"
+    endif
+  endif
   if os ==# 'Linux' && is_arm
     let bin_suffix = 'linux_arm'
   elseif os ==# 'Linux'
@@ -194,11 +184,8 @@ function! codeium#server#Start(...) abort
     let bin_suffix = 'macos_arm'
   elseif os ==# 'Darwin'
     let bin_suffix = 'macos_x64'
-  elseif os ==# 'Windows'
-    let bin_suffix = 'windows_x64.exe'
   else
-    call codeium#log#Error('Unsupported OS: ' . os)
-    return
+    let bin_suffix = 'windows_x64.exe'
   endif
 
   let config = get(g:, 'codeium_server_config', {})
@@ -227,53 +214,7 @@ function! codeium#server#Start(...) abort
       else
         let base_url = 'https://github.com/Exafunction/codeium/releases/download'
       endif
-      let base_url = substitute(base_url, '/\+
-
-function! s:ActuallyStart() abort
-  let config = get(g:, 'codeium_server_config', {})
-  let chat_ports = get(g:, 'codeium_port_config', {})
-  let manager_dir = tempname() . '/codeium/manager'
-  call mkdir(manager_dir, 'p')
-  let args = [
-        \ s:bin,
-        \ '--api_server_url', get(config, 'api_url', 'https://server.codeium.com'),
-        \ '--enable_local_search', '--enable_index_service', '--search_max_workspace_file_count', '5000',
-        \ '--enable_chat_web_server', '--enable_chat_client'
-        \ ]
-  if has_key(config, 'api_url') && !empty(config.api_url)
-    let args += ['--enterprise_mode']
-    let args += ['--portal_url', get(config, 'portal_url', 'https://codeium.example.com')]
-  endif
-  if !codeium#util#IsUsingRemoteChat()
-    let args += ['--manager_dir', manager_dir]
-  endif
-  " If either of these is set, only one vim window (with any number of buffers) will work with Codeium.
-  " Opening other vim windows won't be able to use Codeium features.
-  if has_key(chat_ports, 'web_server') && !empty(chat_ports.web_server)
-    let args += ['--chat_web_server_port', chat_ports.web_server]
-  endif
-  if has_key(chat_ports, 'chat_client') && !empty(chat_ports.chat_client)
-    let args += ['--chat_client_port', chat_ports.chat_client]
-  endif
-
-  call codeium#log#Info('Launching server with manager_dir ' . manager_dir)
-  if has('nvim')
-    let g:codeium_server_job = jobstart(args, {
-                \ 'on_stderr': { channel, data, t -> codeium#log#Info('[SERVER] ' . join(data, "\n")) },
-                \ })
-  else
-    let g:codeium_server_job = job_start(args, {
-                \ 'out_mode': 'raw',
-                \ 'err_cb': { channel, data -> codeium#log#Info('[SERVER] ' . data) },
-                \ })
-  endif
-  if !codeium#util#IsUsingRemoteChat()
-    call timer_start(500, function('s:FindPort', [manager_dir]), {'repeat': -1})
-  endif
-
-  call timer_start(5000, function('s:SendHeartbeat', []), {'repeat': -1})
-endfunction
-, '', '')
+      let base_url = substitute(base_url, '/\+$', '', '')
       let url = base_url . '/language-server-v' . s:language_server_version . '/language_server_' . bin_suffix . '.gz'
     else
       let url = 'https://storage.googleapis.com/exafunction-dist/codeium/' . sha . '/language_server_' . bin_suffix . '.gz'
@@ -288,32 +229,29 @@ endfunction
     call s:ActuallyStart()
   endif
 endfunction
-
 function! s:UnzipAndStart(status) abort
   if has('win32')
-    let old_shell_settings = {
-          \ 'shell': &shell,
-          \ 'shellquote': &shellquote,
-          \ 'shellpipe': &shellpipe,
-          \ 'shellxquote': &shellxquote,
-          \ 'shellcmdflag': &shellcmdflag,
-          \ 'shellredir': &shellredir,
-          \ }
-    try
-      let &shell = 'powershell'
-      set shellquote=\"
-      set shellpipe=\|
-      set shellcmdflag=-NoLogo\ -NoProfile\ -ExecutionPolicy\ RemoteSigned\ -Command
-      set shellredir=\|\[Out-File\]\ -Encoding\ UTF8
-      call system('& { . ' . shellescape(s:root . '/powershell/gzip.ps1') . '; Expand-File ' . shellescape(s:bin . '.gz') . ' }')
-    finally
-      let &shell = old_shell_settings.shell
-      let &shellquote = old_shell_settings.shellquote
-      let &shellpipe = old_shell_settings.shellpipe
-      let &shellxquote = old_shell_settings.shellxquote
-      let &shellcmdflag = old_shell_settings.shellcmdflag
-      let &shellredir = old_shell_settings.shellredir
-    endtry
+    " Save old settings.
+    let old_shell = &shell
+    let old_shellquote = &shellquote
+    let old_shellpipe = &shellpipe
+    let old_shellxquote = &shellxquote
+    let old_shellcmdflag = &shellcmdflag
+    let old_shellredir = &shellredir
+    " Switch to powershell.
+    let &shell = 'powershell'
+    set shellquote=\"
+    set shellpipe=\|
+    set shellcmdflag=-NoLogo\ -NoProfile\ -ExecutionPolicy\ RemoteSigned\ -Command
+    set shellredir=\|\ Out-File\ -Encoding\ UTF8
+    call system('& { . ' . shellescape(s:root . '/powershell/gzip.ps1') . '; Expand-File ' . shellescape(s:bin . '.gz') . ' }')
+    " Restore old settings.
+    let &shell = old_shell
+    let &shellquote = old_shellquote
+    let &shellpipe = old_shellpipe
+    let &shellxquote = old_shellxquote
+    let &shellcmdflag = old_shellcmdflag
+    let &shellredir = old_shellredir
   else
     if !executable('gzip')
       call codeium#log#Error('Failed to extract language server binary: missing `gzip`.')
@@ -329,7 +267,6 @@ function! s:UnzipAndStart(status) abort
   call s:ActuallyStart()
 endfunction
 
-
 function! s:ActuallyStart() abort
   let config = get(g:, 'codeium_server_config', {})
   let chat_ports = get(g:, 'codeium_port_config', {})
@@ -374,3 +311,8 @@ function! s:ActuallyStart() abort
 
   call timer_start(5000, function('s:SendHeartbeat', []), {'repeat': -1})
 endfunction
+
+
+
+
+
